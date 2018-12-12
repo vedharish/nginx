@@ -76,6 +76,13 @@ typedef struct {
     unsigned                         proxy_recursive:1;
 
     ngx_int_t                        index;
+    ngx_conf_t                      *original_ngx_conf;
+    ngx_cycle_t                     *original_ngx_conf_cycle;
+    ngx_str_t                       *original_file_path;
+
+    time_t                           last_check;
+    time_t                           last_change;
+    time_t                           check_interval;
 } ngx_http_geo_ctx_t;
 
 
@@ -170,11 +177,100 @@ static ngx_http_geo_header_t  ngx_http_geo_header = {
 
 /* geo range is AF_INET only */
 
+/* This function is a getter / setter handler function             */
+/* for the variable which is the first argument to 'geo' directive */
 static ngx_int_t
 ngx_http_geo_cidr_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v,
     uintptr_t data)
 {
     ngx_http_geo_ctx_t *ctx = (ngx_http_geo_ctx_t *) data;
+
+    /* We check the include file mtime every check_interval so as to  */
+    /* not poll the file system for every request                     */
+    if (ctx->last_check + ctx->check_interval < ngx_time()) {
+      ctx->last_check = ngx_time();
+      ngx_str_t * file_path;
+
+      file_path = ngx_palloc(r->pool, sizeof(ngx_str_t));
+      file_path->data = ngx_pstrdup(r->pool, ctx->original_file_path);
+      file_path->len = ctx->original_file_path->len;
+
+      ngx_file_info_t          fi;
+      if (ngx_file_info(file_path->data, &fi) == NGX_FILE_ERROR) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "CUSTOM_GEO_RELOAD: fileinfo \"%s\" failed",
+            file_path->data);
+      } else if (ngx_file_mtime(&fi) <= ctx->last_change) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "CUSTOM_GEO_RELOAD: file \"%s\" has not changed",
+            file_path->data);
+      } else {
+        /* If the file has changed, we will reload the 'include' file for the */
+        /* 'geo' directive in conf. The 'include' file has a mapping of       */
+        /* (ipsubnets -> variable_value). This is done so that we do not      */
+        /* reload nginx / restart worker processes each time the file changes */
+        ctx->last_change = ngx_file_mtime(&fi);
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "CUSTOM_GEO_RELOAD: custom reloading \"%s\" file for path \"%s\"",
+            file_path->data, (r->uri).data);
+
+        /* ngx_conf_t structure preserved from when we first parsed main conf */
+        ngx_conf_t * cf_dummy = ctx->original_ngx_conf;
+        cf_dummy->cycle = ctx->original_ngx_conf_cycle;
+        cf_dummy->handler = ngx_http_geo;
+        cf_dummy->log = r->connection->log;
+        /* In case the array size exceeds 10, nginx will allocate memory */
+        /* for 10 more elements from the same pool                       */
+        cf_dummy->args = ngx_array_create(r->pool, 10, sizeof(ngx_str_t));
+        cf_dummy->pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE,
+            r->connection->log);
+        if (cf_dummy->pool == NULL) {
+          ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+              "CUSTOM_GEO_RELOAD: Failed to allocate memory for cf pool");
+        }
+
+        ngx_http_geo_conf_ctx_t ctx_dummy;
+        ngx_memzero(&ctx_dummy, sizeof(ngx_http_geo_conf_ctx_t));
+
+        ctx_dummy.temp_pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE,
+            r->connection->log);
+        if (ctx_dummy.temp_pool == NULL) {
+          ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+              "CUSTOM_GEO_RELOAD: Failed to allocate memory for ctx temp_pool");
+        }
+
+        ctx_dummy.pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE,
+            r->connection->log);
+        if (ctx_dummy.pool == NULL) {
+          ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+              "CUSTOM_GEO_RELOAD: Failed to allocate memory for ctx pool");
+        }
+
+        ctx_dummy.data_size = sizeof(ngx_http_geo_header_t)
+          + sizeof(ngx_http_variable_value_t)
+          + 0x10000 * sizeof(ngx_http_geo_range_t *);
+        ctx_dummy.allow_binary_include = 1;
+
+        /* geo_module keeps a structure of ip -> variable value in rbtree */
+        ngx_rbtree_init(&ctx_dummy.rbtree, &ctx_dummy.sentinel,
+            ngx_str_rbtree_insert_value);
+
+        cf_dummy->ctx = &ctx_dummy;
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "CUSTOM_GEO_RELOAD: re-parsing the included conf");
+
+        ngx_http_geo_include(cf_dummy, &ctx_dummy, file_path);
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "CUSTOM_GEO_RELOAD: parsing done, moving ahead");
+
+        ctx->proxies = ctx_dummy.proxies;
+        ctx->proxy_recursive = ctx_dummy.proxy_recursive;
+        ctx->u.trees.tree = ctx_dummy.tree;
+      }
+    }
 
     in_addr_t                   inaddr;
     ngx_addr_t                  addr;
@@ -462,6 +558,16 @@ ngx_http_geo_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     geo->proxies = ctx.proxies;
     geo->proxy_recursive = ctx.proxy_recursive;
+    geo->original_ngx_conf = cf;
+    geo->original_ngx_conf_cycle = cf->cycle;
+    geo->original_file_path = ngx_palloc(cf->pool, sizeof(ngx_str_t));
+    geo->original_file_path->data = ngx_pstrdup(cf->pool, &(ctx.include_name));
+    geo->original_file_path->len = ctx.include_name.len;
+
+    geo->last_check = geo->last_change = ngx_time();
+
+    ngx_str_t check_interval_time = ngx_string("60");
+    geo->check_interval = ngx_parse_time(&check_interval_time, 1);
 
     if (ctx.ranges) {
 
